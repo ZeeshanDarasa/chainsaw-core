@@ -186,7 +186,7 @@
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
-   Copyright 2026 Chainsaw Security
+   Copyright 2026 Chain305
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -199,22 +199,3 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
    implied. See the License for the specific language governing
    permissions and limitations under the License.
-
-----
-
-SCOPE OF THIS LICENSE
-=====================
-
-This Apache-2.0 license covers the Chainsaw open-core engine in this module
-(`github.com/ZeeshanDarasa/chainsaw-core`) — the `chainsaw` CLI and the
-libraries that decide whether a package is safe to install: the proxy,
-policy/policyengine, intelligence, risk, typosquat, malware, depgraph, SBOM,
-and provenance packages. You may freely use, modify, vendor, and redistribute
-this code under the terms above, with no account required.
-
-The Chainsaw enterprise components are NOT part of this module and are NOT
-covered by this license: the multi-tenant server (`chainsaw-proxy`), the
-dashboard, premium intelligence providers, SSO/SCIM, the hardening engine,
-policy signing, and SIEM delivery are closed-source commercial software,
-compiled only into the enterprise build (`//go:build enterprise`) and governed
-by your Chainsaw subscription agreement, not by this Apache-2.0 license.
