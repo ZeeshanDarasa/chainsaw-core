@@ -26,3 +26,30 @@ func TestResolveModeDebugBeatsOffline(t *testing.T) {
 		t.Fatalf("ResolveMode with DEBUG=1 OFFLINE=1 = %v, want ModeDebug", got)
 	}
 }
+
+// TestRefusalSharingEnabledDefaultsOff pins the most important property
+// of the refused-package consent: it is OFF unless the operator has set
+// an explicit truthy value. Absence, emptiness, and unrecognised values
+// must all resolve to false (fail-closed) so a refused package's
+// identifying payload never rides the generic telemetry toggle.
+func TestRefusalSharingEnabledDefaultsOff(t *testing.T) {
+	cases := map[string]bool{
+		"":       false, // unset / absent
+		"0":      false,
+		"false":  false,
+		"no":     false,
+		"maybe":  false, // unrecognised ⇒ fail-closed
+		"  ":     false,
+		"1":      true,
+		"true":   true,
+		"TRUE":   true,
+		"yes":    true,
+		" true ": true, // trimmed
+	}
+	for val, want := range cases {
+		t.Setenv("CHAINSAW_REFUSAL_SHARING", val)
+		if got := RefusalSharingEnabled(); got != want {
+			t.Fatalf("RefusalSharingEnabled with %q = %v, want %v", val, got, want)
+		}
+	}
+}

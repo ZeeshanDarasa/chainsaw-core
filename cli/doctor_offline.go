@@ -101,9 +101,13 @@ func runDoctorOffline(cmd *cobra.Command, _ []string) error {
 		if bundle.Stale() {
 			fmt.Fprintf(out, "  ⚠ stale: bundle is older than %s — schedule a refresh.\n", intelligence.BundleStaleAfter)
 		}
-		if !bundle.Verified() {
-			fmt.Fprintln(out, "  ⚠ unsigned: signature verification was skipped (CHAINSAW_INTEL_BUNDLE_SKIP_VERIFY=1)")
-		}
+		// Verification posture: skipped, digest-bound integrity only, or full
+		// Sigstore authenticity. Distinguishes the two layers so operators
+		// know whether the loaded bundle is merely tamper-checked or actually
+		// bot-signed. Active bundle picks up CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY
+		// at load time, so this reflects the operator's chosen posture.
+		sym, txt := bundleVerificationStatus(bundle.Verified(), bundle.Authenticated())
+		fmt.Fprintf(out, "  verify:      %s %s\n", sym, txt)
 	} else {
 		fmt.Fprintln(out, "  bundle:      (not loaded — refreshable providers will run with empty data)")
 	}

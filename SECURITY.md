@@ -72,6 +72,14 @@ users, and gives us a reasonable chance to remediate before disclosure.
 
 ## Verifying a release
 
+> **Pre-GA:** no public release has been cut yet and the `chainsaw-releases`
+> Sigstore signer identity is not yet provisioned, so the signed-release
+> artefacts and the `cosign`/`slsa-verifier` commands below are not available
+> today. Until the first signed release ships, install via the hosted
+> one-liner (`curl -fsSL https://chain305.com/install.sh | sh`, which verifies
+> the published SHA-256 checksum) or `go install`, and track the signing
+> cutover in the release notes.
+
 Once published, every tagged release of this module ships:
 
 - **SLSA Build L3 provenance** (`multiple.intoto.jsonl`) for every CLI

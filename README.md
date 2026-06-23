@@ -36,9 +36,17 @@ go install github.com/ZeeshanDarasa/chainsaw-core/cmd/chainsaw@latest
 This drops a `chainsaw` binary in `$(go env GOPATH)/bin`. Make sure that
 directory is on your `PATH`.
 
-Pre-built release binaries (with SLSA provenance and Sigstore signatures)
-will be published on the [GitHub Releases](https://github.com/ZeeshanDarasa/chainsaw-core/releases)
-page once the first public release is cut. Until then, install from source.
+Or install the pre-built binary with the hosted one-liner (detects your
+OS/arch and verifies the SHA-256 checksum):
+
+```sh
+curl -fsSL https://chain305.com/install.sh | sh
+```
+
+Signed GitHub Releases (SLSA provenance + Sigstore signatures) will follow
+once the first signed release is cut (pending the release-signer bot); until
+then, the one-liner above, `go install`, and building from source are the
+supported install paths.
 
 ## Quickstart
 
@@ -90,4 +98,9 @@ The module is self-contained: it builds standalone with `GOWORK=off go build ./.
 
 ## License
 
-Not yet set. A license will be added before the first public release.
+Apache License 2.0 — see [LICENSE](LICENSE). This module (the `chainsaw` CLI
+and the decision engine: proxy, policy, intelligence, risk, typosquat,
+malware, depgraph, SBOM, provenance) is free and open source, no account
+required. The enterprise control plane (multi-tenant server, dashboard,
+premium intelligence, SSO/SCIM, hardening, policy signing, SIEM) is
+closed-source commercial software in a separate private module.

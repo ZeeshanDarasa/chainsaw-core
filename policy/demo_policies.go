@@ -15,22 +15,27 @@ import (
 const demoPolicyPrefix = "Demo: "
 
 // MalwareFeedPolicyName is the policy_name surfaced on every malware-feed
-// refusal (CHW-2303). The proxy's malware-block path emits this name
-// when no operator-defined policy was the proximate cause — the block
-// originates from the malicious-packages feed, not a configured rule,
-// but the wire response still needs a `policy_name` so the developer-side
-// error output names both the signal (MAL-NNNN id) AND a human-readable
-// policy label. Matches the demo-seeded "Block known malware" rule by
-// design: in the common case where the org has the demo policy enabled
-// the malware-feed block and the policy block are semantically the same
-// event, just resolved at different layers.
+// refusal (CHW-2303). The proxy's malware-block path emits this name when no
+// operator-defined policy was the proximate cause — the block originates from
+// the malicious-packages feed, not a configured rule, but the wire response
+// still needs a `policy_name` so the developer-side error output names both the
+// signal (MAL-NNNN id) AND a human-readable policy label.
 //
-// Chain305.com smoke 2026-05-20 confirmed npm-tarball refusals were
-// shipping no `policy_name` at all, breaking parity with the pip path
-// (where the policy engine drove the block). Wire this constant through
-// every malware-feed-side refusal builder so both ecosystems read the
-// same shape.
-const MalwareFeedPolicyName = demoPolicyPrefix + "Block known malware"
+// This is a PRODUCTION label: it shows to every customer on every malware-feed
+// block — including orgs that never had, or have since deleted, the Try-Me
+// rule below. It therefore deliberately does NOT carry demoPolicyPrefix. A
+// feed-driven refusal is not a demo rule, and labelling a real malware block
+// "Demo: ..." read as unpolished/untrustworthy. Activation telemetry does not
+// key off this name: the malware-feed path tags its first-block event with
+// block_source="malware_feed" (see server_repo_pipeline.go), so the label and
+// the telemetry classification are decoupled. The demo-seeded rule keeps its
+// "Demo: " prefix because it genuinely is an editable Try-Me rule.
+//
+// Chain305.com smoke 2026-05-20 confirmed npm-tarball refusals were shipping no
+// `policy_name` at all, breaking parity with the pip path (where the policy
+// engine drove the block). Wire this constant through every malware-feed-side
+// refusal builder so both ecosystems read the same shape.
+const MalwareFeedPolicyName = "Block known malware"
 
 // DemoPolicies is the canonical set of demo policies seeded once per
 // new org so a brand-new user can run a single install against a

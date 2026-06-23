@@ -35,9 +35,11 @@ package intelligence
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -45,10 +47,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ZeeshanDarasa/chainsaw-core/provenance/sigstoreverify"
 )
 
 // BundleManifestSchema is the canonical schema id for the manifest.json
@@ -70,6 +75,25 @@ const BundleIdentityEnvVar = "CHAINSAW_INTEL_BUNDLE_IDENTITY"
 // signature verification — strictly for local builds and tests. Logged
 // loudly in the proxy startup banner when enabled.
 const BundleSkipVerifyEnvVar = "CHAINSAW_INTEL_BUNDLE_SKIP_VERIFY"
+
+// BundleStrictVerifyEnvVar opts the loader into FULL Sigstore
+// authenticity (Fulcio cert chain + Rekor transparency-log inclusion +
+// OIDC issuer + signer-identity regexp), on top of the always-on digest
+// binding. It is OFF by default because today's bundles ship a
+// digest-only sidecar, not a bot-minted unified Sigstore bundle; flipping
+// it on before the chainsaw-release-signer bot cutover would hard-fail
+// every current bundle and regress offline/airgap operators. Once the
+// signer bot lands and bundles ship a real .sigstore, this becomes the
+// recommended posture (and eventually the default — see the cutover
+// checklist in docs). Accepts the same truthy values as the other
+// chainsaw bool env vars (1/true/yes/on).
+const BundleStrictVerifyEnvVar = "CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY"
+
+// DefaultIntelSignerOIDCIssuer is the OIDC issuer the intel-bundle signer
+// authenticates against. Mirrors X1 / the policy bundle: both bots use
+// GitHub Actions OIDC. Operators publishing their own bundles from a
+// different CI override it via BundleVerifyOptions.IssuerURL.
+const DefaultIntelSignerOIDCIssuer = "https://token.actions.githubusercontent.com"
 
 // BundleStaleAfter is the freshness threshold for the doctor warning.
 // A bundle older than this is still loadable but `chainsaw doctor
@@ -112,8 +136,12 @@ type Bundle struct {
 	files map[string][]byte
 	// digest is the canonical bundle hash the signature was minted over.
 	digest [32]byte
-	// verified is true iff signature verification passed.
+	// verified is true iff signature verification passed (either layer).
 	verified bool
+	// authenticated is true iff the full Sigstore authenticity layer
+	// (strict mode) ran and passed — Fulcio cert chain + Rekor inclusion +
+	// OIDC issuer + signer-identity, not just the always-on digest binding.
+	authenticated bool
 	// path is the original on-disk path (for diagnostics).
 	path string
 }
@@ -121,8 +149,17 @@ type Bundle struct {
 // VerifyOptions tunes the signature check. Zero value is safe.
 type BundleVerifyOptions struct {
 	// IdentityRegexp constrains the cert subject. Empty falls back to
-	// DefaultIntelSignerIdentityRegexp.
+	// DefaultIntelSignerIdentityRegexp. Only consulted in strict mode.
 	IdentityRegexp string
+	// IssuerURL constrains the OIDC issuer in strict mode. Empty falls
+	// back to DefaultIntelSignerOIDCIssuer.
+	IssuerURL string
+	// RequireAuthenticity opts into full Sigstore verification (Fulcio
+	// cert chain + Rekor inclusion + issuer + identity regexp) on top of
+	// the always-on digest binding. Equivalent to setting
+	// CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY=1. OFF by default — see that
+	// env var's doc for the safety rationale and the cutover plan.
+	RequireAuthenticity bool
 	// SkipSignature disables Sigstore verification. NEVER set in
 	// production; the loader honors CHAINSAW_INTEL_BUNDLE_SKIP_VERIFY
 	// only for local dev / testing.
@@ -184,22 +221,28 @@ func LoadBundle(ctx context.Context, path string, opts BundleVerifyOptions) (*Bu
 
 	skip := opts.SkipSignature || envTruthy(BundleSkipVerifyEnvVar)
 	verified := false
+	authenticated := false
 	if !skip {
 		// The signature lives at <path>.sigstore — same convention as the
 		// policy bundle. We delegate to the shared sigstore verifier so
 		// both bundle types ride the same trust root.
-		if err := verifyBundleSignature(ctx, abs, digest[:], opts.IdentityRegexp); err != nil {
+		strict := opts.RequireAuthenticity || envTruthy(BundleStrictVerifyEnvVar)
+		if err := verifyBundleSignature(ctx, abs, digest[:], opts.IdentityRegexp, opts.IssuerURL, strict); err != nil {
 			return nil, fmt.Errorf("intel bundle: signature verify: %w", err)
 		}
 		verified = true
+		// In strict mode the authenticity layer (Fulcio + Rekor + issuer +
+		// identity) ran and passed; otherwise only digest binding did.
+		authenticated = strict
 	}
 
 	return &Bundle{
-		manifest: manifest,
-		files:    files,
-		digest:   digest,
-		verified: verified,
-		path:     abs,
+		manifest:      manifest,
+		files:         files,
+		digest:        digest,
+		verified:      verified,
+		authenticated: authenticated,
+		path:          abs,
 	}, nil
 }
 
@@ -302,17 +345,41 @@ func envTruthy(name string) bool {
 
 // verifyBundleSignature is the sigstore verification hook. It is
 // deliberately a thin wrapper around the same verifier the policy
-// bundle uses so a future trust-root change touches one file.
+// bundle uses (provenance/sigstoreverify, also used by
+// internal/policy/dsl/signing.VerifyBundle) so a future trust-root
+// change touches one file and never re-implements crypto.
 //
-// Stub-style implementation today: the chainsaw-release-signer bot for
-// the intel bundle is on the same provisioning path as E5/X1
-// (TODO_E5_OPA_SIGNING.md). Until the bot lands, we return nil if the
-// .sigstore sidecar parses as JSON and contains the expected digest;
-// once the bot exists this swaps to dsl.VerifyBundle's call into
-// sigstoreverify. Operators who need real verification today set
-// CHAINSAW_INTEL_BUNDLE_SKIP_VERIFY=0 and supply a self-issued bundle
-// matching their own IdentityRegexp.
-func verifyBundleSignature(ctx context.Context, bundlePath string, digest []byte, identityRegexp string) error {
+// TWO LAYERS, gated by `strict`:
+//
+//  1. DIGEST BINDING (always on). The sidecar's messageDigest MUST
+//     decode (hex or base64) to exactly the canonical bundle digest
+//     computed over the tarball contents; any mismatch, missing digest,
+//     or malformed sidecar is a hard fail. This stops a forged or
+//     tampered bundle (or an empty/placeholder sidecar) from loading as
+//     Verified()==true. It is INTEGRITY (the bundle was not altered
+//     after the sidecar was written), NOT authenticity (who wrote it):
+//     a self-publisher can still mint a sidecar carrying the matching
+//     digest. This is the SAFE DEFAULT and the only layer today's
+//     not-yet-bot-signed bundles can satisfy.
+//
+//  2. FULL SIGSTORE AUTHENTICITY (strict only). When `strict` is set
+//     (BundleVerifyOptions.RequireAuthenticity or
+//     CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY=1) the sidecar is additionally
+//     verified as a unified Sigstore bundle against the live Sigstore
+//     trust root: Fulcio certificate chain, Rekor transparency-log
+//     inclusion proof, OIDC issuer, and signer-IDENTITY regexp
+//     (identityRegexp / DefaultIntelSignerIdentityRegexp). This is the
+//     same pipeline signing.VerifyBundle runs for the OPA policy bundle.
+//     It is OFF by default until the chainsaw-release-signer bot lands
+//     and bundles ship a real .sigstore — flipping it on before then
+//     would hard-fail every current bundle and regress offline/airgap
+//     operators (see the function-level env-var doc).
+//
+// Note the digest-only sidecars shipped today are NOT parseable as a
+// unified Sigstore bundle, so strict mode correctly rejects them: that
+// is the point — they are not authenticated yet. Dev/test bypass: set
+// CHAINSAW_INTEL_BUNDLE_SKIP_VERIFY=1 (logged loudly on the proxy banner).
+func verifyBundleSignature(ctx context.Context, bundlePath string, digest []byte, identityRegexp, issuerURL string, strict bool) error {
 	sigPath := bundlePath + ".sigstore"
 	data, err := os.ReadFile(sigPath)
 	if err != nil {
@@ -321,27 +388,116 @@ func verifyBundleSignature(ctx context.Context, bundlePath string, digest []byte
 		}
 		return fmt.Errorf("read sigstore sidecar: %w", err)
 	}
-	// Cheap structural validation — confirms the sidecar is well-formed
-	// JSON and references this bundle's digest. Real Sigstore verify is
-	// gated on the bot account cutover (see comment above).
+
+	// Layer 1 — digest binding (always on).
+	if err := verifyBundleDigestBinding(sigPath, data, digest); err != nil {
+		return err
+	}
+	if !strict {
+		return nil
+	}
+
+	// Layer 2 — full Sigstore authenticity (strict only). Delegate to the
+	// shared verifier; never hand-roll crypto here.
+	return verifyBundleAuthenticity(ctx, sigPath, data, digest, identityRegexp, issuerURL)
+}
+
+// verifyBundleDigestBinding implements layer 1: the sidecar's
+// messageSignature.messageDigest must decode to the canonical bundle
+// digest. Fail-closed on missing/malformed/mismatched digest.
+func verifyBundleDigestBinding(sigPath string, data, digest []byte) error {
 	var probe struct {
 		MessageSignature struct {
 			MessageDigest struct {
-				Digest string `json:"digest"`
+				Algorithm string `json:"algorithm"`
+				Digest    string `json:"digest"`
 			} `json:"messageDigest"`
 		} `json:"messageSignature"`
 	}
-	if err := json.Unmarshal(data, &probe); err == nil && probe.MessageSignature.MessageDigest.Digest != "" {
-		// The sidecar's embedded digest is base64; we accept either the
-		// raw hex (from older sign tools) or matching base64.
-		// We don't enforce equality here because the production verifier
-		// (sigstoreverify.Default) will, once wired.
-		_ = probe
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return fmt.Errorf("malformed sigstore sidecar %s: %w", sigPath, err)
 	}
-	_ = ctx
-	_ = digest
-	_ = identityRegexp
+	sidecarDigestStr := strings.TrimSpace(probe.MessageSignature.MessageDigest.Digest)
+	if sidecarDigestStr == "" {
+		return fmt.Errorf("sigstore sidecar %s carries no messageSignature.messageDigest.digest — re-sign the bundle or set %s=1 for dev", sigPath, BundleSkipVerifyEnvVar)
+	}
+	sidecarDigest, ok := decodeBundleDigest(sidecarDigestStr)
+	if !ok {
+		return fmt.Errorf("sigstore sidecar %s: digest %q is neither valid hex nor base64", sigPath, sidecarDigestStr)
+	}
+	if !bytes.Equal(sidecarDigest, digest) {
+		return fmt.Errorf("sigstore sidecar %s digest does not match the bundle contents (sidecar=%s bundle=%s) — the bundle was modified after signing, or this sidecar belongs to a different bundle",
+			sigPath, hex.EncodeToString(sidecarDigest), hex.EncodeToString(digest))
+	}
 	return nil
+}
+
+// verifyBundleAuthenticity implements layer 2: full Sigstore verification
+// of the unified sidecar against the live trust root, plus issuer and
+// signer-identity pinning. Mirrors internal/policy/dsl/signing.VerifyBundle
+// step-for-step so both bundle types share one trust-root + identity idiom.
+func verifyBundleAuthenticity(ctx context.Context, sigPath string, data, digest []byte, identityRegexp, issuerURL string) error {
+	verifier, err := sigstoreverify.Default(ctx)
+	if err != nil {
+		return fmt.Errorf("load sigstore trust root: %w", err)
+	}
+	// Cryptographic verification: cert chain -> Fulcio CA, signature ->
+	// bundle digest, Rekor inclusion proof. sigstoreverify.Verify enforces
+	// all three (it is built WithTransparencyLog(1) + WithObserverTimestamps).
+	id, err := verifier.Verify(data, digest)
+	if err != nil {
+		return fmt.Errorf("sigstore verify %s: %w", sigPath, err)
+	}
+	if id == nil {
+		return fmt.Errorf("sigstore verify %s: nil identity", sigPath)
+	}
+
+	// Identity pinning: the cert is valid + the signature covers the
+	// bundle, but is the signer the right bot?
+	wantIssuer := issuerURL
+	if wantIssuer == "" {
+		wantIssuer = DefaultIntelSignerOIDCIssuer
+	}
+	if id.Issuer != wantIssuer {
+		return fmt.Errorf("intel bundle oidc issuer mismatch: cert=%q want=%q", id.Issuer, wantIssuer)
+	}
+	wantIdentity := identityRegexp
+	if wantIdentity == "" {
+		wantIdentity = DefaultIntelSignerIdentityRegexp
+	}
+	re, err := regexp.Compile(wantIdentity)
+	if err != nil {
+		return fmt.Errorf("compile intel signer identity regexp %q: %w", wantIdentity, err)
+	}
+	if !re.MatchString(id.BuilderID) {
+		return fmt.Errorf("intel bundle oidc identity mismatch: cert=%q want match=%q", id.BuilderID, wantIdentity)
+	}
+	return nil
+}
+
+// decodeBundleDigest decodes a sidecar digest string into raw bytes.
+// Sigstore JSON encodes messageDigest as standard base64; older sign
+// tools emitted hex. We try hex first, then the base64 variants, so a
+// re-sign is not forced. Returns ok=false if no encoding yields bytes.
+// A wrong-but-decodable digest still fails the equality check in the
+// caller, so this is fail-closed either way.
+func decodeBundleDigest(s string) ([]byte, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	if b, err := hex.DecodeString(s); err == nil && len(b) > 0 {
+		return b, true
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding,
+		base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil && len(b) > 0 {
+			return b, true
+		}
+	}
+	return nil, false
 }
 
 // Verified reports whether the bundle's signature was checked. False
@@ -351,6 +507,20 @@ func (b *Bundle) Verified() bool {
 		return false
 	}
 	return b.verified
+}
+
+// Authenticated reports whether the bundle passed FULL Sigstore
+// authenticity — the strict layer: Fulcio cert chain + Rekor inclusion +
+// OIDC issuer + signer-identity regexp — as opposed to only the always-on
+// digest binding. False means the bundle is at most integrity-bound
+// (digest-checked) — the safe default until the chainsaw-release-signer
+// bot cutover — or that verification was skipped. Always false when
+// Verified() is false. Safe on nil.
+func (b *Bundle) Authenticated() bool {
+	if b == nil {
+		return false
+	}
+	return b.authenticated
 }
 
 // Manifest returns the parsed manifest. Safe on nil.

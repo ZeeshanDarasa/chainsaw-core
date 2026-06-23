@@ -91,6 +91,26 @@ func (m Mode) String() string {
 	}
 }
 
+// RefusalSharingEnabled reports whether the operator has given the
+// SEPARATE, explicit consent to share refused-package IDENTIFYING data
+// (package name, version, malware id) off-box.
+//
+// This is deliberately NOT the generic telemetry toggle. Generic
+// telemetry being ON only buys the right to emit anonymous, aggregate
+// conversion signals ("a refusal happened"). The identifying payload of a
+// refusal — for a security product, the single most sensitive thing on
+// the box — requires this dedicated opt-in. Default is OFF: absence,
+// emptiness, or any unrecognised value all resolve to false. Only an
+// explicit truthy value (1/true/yes) flips it on. Fail-closed by
+// construction: there is no code path here that returns true for an
+// ambiguous input.
+//
+// Mirrors the CHAINSAW_TELEMETRY_ENABLED opt-in idiom (envTrue) so the
+// two consents share one mental model: env var, truthy-only, default off.
+func RefusalSharingEnabled() bool {
+	return envTrue("CHAINSAW_REFUSAL_SHARING")
+}
+
 // Endpoint returns the URL the SDK should POST event batches to.
 // Honors CHAINSAW_TELEMETRY_ENDPOINT for self-hosters and test harnesses;
 // otherwise uses the provided default (which the caller derives from the

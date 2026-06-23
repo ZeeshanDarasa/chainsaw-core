@@ -57,7 +57,23 @@ docs/install/AIRGAP.md for the refresh cadence and per-provider matrix.`,
 	return cmd
 }
 
+// bundleVerificationStatus renders the operator-facing one-liner for a
+// loaded bundle's verification posture, mirroring the two layers in
+// intelligence.verifyBundleSignature: skipped, digest-bound integrity only,
+// or full Sigstore authenticity. Kept pure (no *Bundle) for testability.
+func bundleVerificationStatus(verified, authenticated bool) (symbol, text string) {
+	switch {
+	case !verified:
+		return "⚠", "skipped — signature not checked (CHAINSAW_INTEL_BUNDLE_SKIP_VERIFY=1)"
+	case authenticated:
+		return "✓", "authenticated — full Sigstore: Fulcio cert chain + Rekor inclusion + OIDC issuer + signer identity"
+	default:
+		return "✓", "integrity only — digest-bound; authenticity not checked (run with --strict or set CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY=1)"
+	}
+}
+
 func newBundleVerifyCmd() *cobra.Command {
+	var strict bool
 	cmd := &cobra.Command{
 		Use:   "verify <path>",
 		Short: "Verify a bundle's manifest, hashes, and signature",
@@ -67,7 +83,11 @@ func newBundleVerifyCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			b, err := intelligence.LoadBundle(ctx, args[0], intelligence.BundleVerifyOptions{})
+			// --strict (or CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY=1, read inside
+			// LoadBundle) opts into full Sigstore authenticity on top of the
+			// always-on digest binding. Off by default — today's digest-only
+			// bundles fail --strict by design until the signer-bot cutover.
+			b, err := intelligence.LoadBundle(ctx, args[0], intelligence.BundleVerifyOptions{RequireAuthenticity: strict})
 			if err != nil {
 				// BUG-CLI-3: cobra's root error renderer prints `Error: <err>`
 				// automatically (SilenceErrors=true on rootCmd flips through to
@@ -82,11 +102,8 @@ func newBundleVerifyCmd() *cobra.Command {
 			fmt.Fprintf(out, "Version:   %s\n", m.Version)
 			fmt.Fprintf(out, "Digest:    sha256:%s\n", b.Digest())
 			fmt.Fprintf(out, "Built:     %s (%s ago)\n", m.BuildTime.Format(time.RFC3339), b.Age().Round(time.Hour))
-			if b.Verified() {
-				fmt.Fprintln(out, "Signature: ✓ verified")
-			} else {
-				fmt.Fprintln(out, "Signature: ⚠ skipped (CHAINSAW_INTEL_BUNDLE_SKIP_VERIFY)")
-			}
+			sym, txt := bundleVerificationStatus(b.Verified(), b.Authenticated())
+			fmt.Fprintf(out, "Signature: %s %s\n", sym, txt)
 			if b.Stale() {
 				fmt.Fprintf(out, "Freshness: ⚠ stale — bundle older than %s; refresh recommended\n", intelligence.BundleStaleAfter)
 				return fmt.Errorf("stale bundle")
@@ -99,11 +116,14 @@ func newBundleVerifyCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&strict, "strict", false,
+		"Require full Sigstore authenticity (Fulcio cert chain + Rekor inclusion + OIDC issuer + signer identity), not just digest binding. Equivalent to CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY=1. Off by default until the chainsaw-release-signer bot cutover; today's digest-only bundles fail --strict by design.")
 	return cmd
 }
 
 func newBundleApplyCmd() *cobra.Command {
 	var server string
+	var strict bool
 	cmd := &cobra.Command{
 		Use:   "apply <path>",
 		Short: "Hot-swap the running proxy's intel bundle (no restart)",
@@ -120,11 +140,12 @@ first to confirm the bundle is signed and fresh before applying.`,
 			path := args[0]
 			// 1. Verify locally before pushing — fail fast on a bad
 			//    bundle so the operator doesn't poison the proxy.
-			b, err := intelligence.LoadBundle(ctx, path, intelligence.BundleVerifyOptions{})
+			b, err := intelligence.LoadBundle(ctx, path, intelligence.BundleVerifyOptions{RequireAuthenticity: strict})
 			if err != nil {
 				return fmt.Errorf("local verify failed: %w (refusing to apply)", err)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "verified bundle %s (digest sha256:%s)\n", b.Manifest().Version, b.Digest())
+			sym, txt := bundleVerificationStatus(b.Verified(), b.Authenticated())
+			fmt.Fprintf(cmd.OutOrStdout(), "verified bundle %s (digest sha256:%s) — %s %s\n", b.Manifest().Version, b.Digest(), sym, txt)
 
 			if server == "" {
 				server = cfgServerURL()
@@ -161,5 +182,7 @@ first to confirm the bundle is signed and fresh before applying.`,
 		},
 	}
 	cmd.Flags().StringVar(&server, "server", "", "Override the chainsaw-proxy admin URL (default: configured server).")
+	cmd.Flags().BoolVar(&strict, "strict", false,
+		"Require full Sigstore authenticity for the local pre-apply verify (not just digest binding). Equivalent to CHAINSAW_INTEL_BUNDLE_STRICT_VERIFY=1. Off by default until the signer-bot cutover.")
 	return cmd
 }
